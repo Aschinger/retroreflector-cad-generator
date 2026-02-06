@@ -89,134 +89,161 @@ def cut_in_xy_plane_center(
     cube_rot: cq.Workplane,
     keep: str = "top",
     z_offset: float = 0.0,
-    z_height: float = 10_000.0,
+    pad_xy: float = 1.0,
+    pad_z: float = 1.0,
     clean: bool = True,
 ) -> cq.Workplane:
     """
-    Cut a rotated cube by the XY-plane through its center and keep one half.
+    Cut a rotated cube (or any solid) in half by an XY plane through its center,
+    and keep one half.
 
-    Assumptions:
-      - The cube is centered at the origin before rotation.
-      - Rotation axes pass through the origin, so the cube center remains at z=0.
+    The cutting plane is z = z_center + z_offset, where z_center is computed
+    from the solid's bounding box center.
 
     Parameters
     ----------
     cube_rot : cq.Workplane
-        Rotated cube (e.g., output of rotate_hexagonal_cube_corner()).
+        Solid to cut (e.g. cube rotated by arbitrary angles).
     keep : str
-        Which half to keep: "top" (z >= z_offset) or "bottom" (z <= z_offset).
+        "top"  -> keep z >= plane
+        "bottom" -> keep z <= plane
     z_offset : float
-        Moves the cutting plane to z = z_offset (default 0.0).
-    z_height : float
-        Height of the half-space box used for intersection (must be large enough).
+        Offset of the cut plane relative to the solid's center plane.
+        0.0 means exactly through the solid center.
+    pad_xy : float
+        Extra margin added to the halfspace box in X and Y.
+    pad_z : float
+        Extra margin added to the halfspace box height.
     clean : bool
-        If True, runs .clean() on the result.
+        If True, run .clean() on the result.
 
     Returns
     -------
     cq.Workplane
-        The cut cube half (cube_rot_cut).
+        Cut half of the input solid.
     """
     if not isinstance(cube_rot, cq.Workplane):
         raise TypeError("cube_rot must be a cadquery.Workplane")
     if keep not in {"top", "bottom"}:
         raise ValueError("keep must be 'top' or 'bottom'")
-    if z_height <= 0:
-        raise ValueError("z_height must be > 0")
+    if pad_xy < 0 or pad_z < 0:
+        raise ValueError("pad_xy and pad_z must be >= 0")
 
-    # Use the rotated cube's own XY extents for a safe cutting box footprint.
-    bb = cube_rot.val().BoundingBox()
-    size_x = (bb.xmax - bb.xmin) * 2.0
-    size_y = (bb.ymax - bb.ymin) * 2.0
+    solid = cube_rot.val()
+    bb = solid.BoundingBox()
 
-    # Create a large "half-space" box and intersect with the cube.
-    # Center the box so that its top or bottom face lies on the cutting plane z=z_offset.
+    # Bounding box center of the solid (robust even if the solid was translated)
+    cx = 0.5 * (bb.xmin + bb.xmax)
+    cy = 0.5 * (bb.ymin + bb.ymax)
+    cz = 0.5 * (bb.zmin + bb.zmax)
+
+    # Cut plane z = cz + z_offset
+    z_plane = cz + z_offset
+
+    # Tight halfspace box dimensions + padding
+    size_x = (bb.xmax - bb.xmin) + 2.0 * pad_xy
+    size_y = (bb.ymax - bb.ymin) + 2.0 * pad_xy
+    size_z = (bb.zmax - bb.zmin) + 2.0 * pad_z
+
+    # Halfspace must extend beyond the plane in the kept direction
+    # Use a height that certainly covers the whole solid.
+    z_height = size_z * 2.0
+
     if keep == "top":
-        z_center = z_offset + z_height / 2.0
-    else:  # keep == "bottom"
-        z_center = z_offset - z_height / 2.0
+        z_center = z_plane + z_height / 2.0
+    else:
+        z_center = z_plane - z_height / 2.0
 
-    halfspace = generate_rectangle(size_x, size_y, z_height).translate((0.0, 0.0, z_center))
+    halfspace = generate_rectangle(size_x, size_y, z_height).translate((cx, cy, z_center))
 
-    cube_rot_cut = cube_rot.intersect(halfspace)
+    result = cube_rot.intersect(halfspace)
     if clean:
-        cube_rot_cut = cube_rot_cut.clean()
+        result = result.clean()
 
-    return cube_rot_cut
+    return result
 
-def pattern_cubes_staggered(
-    cube: cq.Workplane,
-    nx: int,
-    ny: int,
-    dx: float,
-    dy: float,
-    dx0: float = 0.0,
-    fuse: bool = True,
+import cadquery as cq
+
+
+def cut_at_z_plane_from_top(
+    shape: cq.Workplane,
+    z_plane: float,
+    keep: str = "bottom",
+    pad_xy: float = 1.0,
+    z_height: float | None = None,
     clean: bool = True,
 ) -> cq.Workplane:
     """
-    Create a staggered 2D pattern of cubes (or any solid Workplane), efficiently.
+    Move the object so its top touches z=0, then cut at absolute z_plane.
 
-    Pattern:
-      - Row j at y = j*dy
-      - x offset = dx0 for every second row (j odd), else 0
-      - x positions: i*dx + x_offset
-
-    Efficiency:
-      - Builds a list of transformed solids
-      - Fuses once at the end using combineSolids() (avoids O(N^2) union)
+    After shifting:
+        z = 0      → original top surface
+        z < 0      → inside the part
 
     Parameters
     ----------
-    cube : cq.Workplane
-        Base solid (typically already rotated)
-    nx, ny : int
-        Count in x and y
-    dx, dy : float
-        Pitch in x and y
-    dx0 : float
-        Additional x offset applied to every second row
-    fuse : bool
-        If True, fuse into a single solid where possible
+    shape : cq.Workplane
+        Solid to cut.
+    z_plane : float
+        Cutting plane position AFTER shifting top to z=0.
+        (Usually negative if cutting into the part)
+    keep : str
+        "bottom" -> keep z <= z_plane  (material below the plane)
+        "top"    -> keep z >= z_plane
+    pad_xy : float
+        Extra margin added to the halfspace box in X and Y.
+    z_height : float | None
+        Height of the halfspace box. If None, derived from shape height.
     clean : bool
-        If True, runs .clean() on the result (recommended for STEP)
+        Run .clean() on result.
 
     Returns
     -------
     cq.Workplane
-        Pattern as a fused solid (or a compound if not fusable/disjoint)
+        Cut solid.
     """
-    if not isinstance(cube, cq.Workplane):
-        raise TypeError("cube must be a cadquery.Workplane")
-    if nx <= 0 or ny <= 0:
-        raise ValueError("nx and ny must be > 0")
-    if dx <= 0 or dy <= 0:
-        raise ValueError("dx and dy must be > 0")
 
-    base = cube.val()  # underlying Solid
+    if not isinstance(shape, cq.Workplane):
+        raise TypeError("shape must be cadquery.Workplane")
+    if keep not in {"top", "bottom"}:
+        raise ValueError("keep must be 'top' or 'bottom'")
 
-    solids = []
-    for j in range(ny):
-        x_off = dx0 if (j % 2 == 1) else 0.0
-        y = j * dy
-        # print(f"Processing row {j + 1} of {ny}.")
-        for i in range(nx):
-            x = i * dx + x_off
-            loc = cq.Location(cq.Vector(x, y, 0.0))
-            solids.append(base.moved(loc))
+    solid = shape.val()
+    bb = solid.BoundingBox()
 
-    print(f"[Pattern] Generating new objects in workplane...")
-    wp = cq.Workplane("XY").newObject(solids)
+    # --- shift so top sits at z=0 ---
+    z_shift = -bb.zmax
+    print(f"Shifting shape by z={z_shift:.3f} to place top at z=0")
+    shifted = shape.translate((0, 0, z_shift))
 
-    if fuse:
-        # Fast fuse in one go; avoids repeated boolean unions
-        print(f"[Pattern] Fusing {len(solids)} solids...")
-        wp = wp.union()
+    bb = shifted.val().BoundingBox()
+
+    # footprint
+    size_x = (bb.xmax - bb.xmin) + 2 * pad_xy
+    size_y = (bb.ymax - bb.ymin) + 2 * pad_xy
+    cx = 0.5 * (bb.xmin + bb.xmax)
+    cy = 0.5 * (bb.ymin + bb.ymax)
+
+    # choose height
+    if z_height is None:
+        z_span = bb.zmax - bb.zmin
+        z_height = max(1.0, 2.0 * z_span)
+
+    # place halfspace
+    if keep == "top":
+        z_center = z_plane + z_height / 2.0
+    else:
+        z_center = z_plane - z_height / 2.0
+
+    halfspace = generate_rectangle(size_x, size_y, z_height).translate((cx, cy, z_center))
+
+    result = shifted.intersect(halfspace)
 
     if clean:
-        wp = wp.clean()
+        result = result.clean()
 
-    return wp
+    return result
+
 
 
 def unify_shapes(a: cq.Workplane, b: cq.Workplane) -> cq.Workplane:

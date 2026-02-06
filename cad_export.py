@@ -34,15 +34,38 @@ def _validate_step_path(filepath: str | Path, overwrite: bool = True) -> Path:
     return path.resolve()
 
 
-def export_step(shape: cq.Workplane, filepath: str | Path, overwrite: bool = True) -> Path:
+def export_step(obj: cq.Workplane | cq.Assembly, filepath: str | Path, overwrite: bool = True) -> Path:
     """
-    Export a CadQuery shape to STEP file with path validation.
+    Export a CadQuery object to STEP.
+
+    - Workplane → solid STEP (single part)
+    - Assembly  → assembly STEP (instances preserved)
+
+    Parameters
+    ----------
+    obj : cadquery.Workplane | cadquery.Assembly
+        Object to export
+    filepath : str | Path
+        Output STEP path
+    overwrite : bool
+        Allow overwriting existing file
+
+    Returns
+    -------
+    Path
+        Written file path
     """
-    if not isinstance(shape, cq.Workplane):
-        raise TypeError("shape must be a cadquery.Workplane")
 
     path = _validate_step_path(filepath, overwrite)
 
-    cq.exporters.export(shape, str(path), exportType="STEP")
+    # Assembly export (IMPORTANT: different exporter)
+    if isinstance(obj, cq.Assembly):
+        obj.export(str(path))   # uses assembly exporter
+        return path
 
-    return path
+    # Solid export
+    if isinstance(obj, cq.Workplane):
+        cq.exporters.export(obj, str(path), exportType="STEP")
+        return path
+
+    raise TypeError("obj must be cadquery.Workplane or cadquery.Assembly")
