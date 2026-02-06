@@ -2,7 +2,8 @@ import math
 import time
 
 from geometry import generate_rectangle, rotate_hexagonal_cube_corner, cut_at_z_plane_from_top
-from pattern_assembly import make_pattern_assembly, add_substrate
+from geometry_clip import clip_pattern_assembly_by_bbox
+from pattern_assembly import make_pattern_assembly, add_substrate, add_frame_around_pattern
 from cad_export import export_step, export_mesh
 
 # SETTINGS
@@ -49,7 +50,7 @@ print(f"Generating the pattern...")
 
 # mage the pattern of cubes as an assembly by instancing a 4-row compound,
 # which reduces the number of assembly elements and keeps 'no union' behavior
-assy=make_pattern_assembly(
+assy=clip_pattern_assembly_by_bbox(
     cube=cube_rot_cut,
     nx=nx,
     ny=ny,
@@ -74,6 +75,19 @@ assy = add_substrate(
     dy=y_sep_mm,
     dx0=x_offset_mm,
     edge_length_mm=edge_length_mm,   # cube edge length
+)
+
+assy = add_frame_around_pattern(
+    assy,
+    substrate_thickness=substrate_thickness_mm,
+    margin=substrate_margin_mm,
+    nx=nx,
+    ny=ny,
+    dx=x_sep_mm,
+    dy=y_sep_mm,
+    dx0=x_offset_mm,
+    edge_length_mm=edge_length_mm,
+    clearance=0.0,   # optional opening clearance
 )
 
 # export assemgly as file

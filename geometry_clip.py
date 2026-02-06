@@ -1,6 +1,6 @@
 import cadquery as cq
-from typing import Iterable, List, Tuple
 from geometry import generate_rectangle
+from pattern_assembly import make_nrow_compound
 from dataclasses import dataclass
 
 
@@ -79,189 +79,125 @@ def _bbox_intersects(a: cq.BoundBox, b: cq.BoundBox) -> bool:
         a.zmax < b.zmin or a.zmin > b.zmax
     )
 
-def clip_pattern_only_outer_cubes(
+def clip_pattern_assembly_by_bbox(
     cube: cq.Workplane,
     nx: int,
     ny: int,
     dx: float,
     dy: float,
     dx0: float = 0.0,
+    block_rows: int = 4,
     margin_x: float = 0.0,
     margin_y: float = 0.0,
     z_height: float = 10_000.0,
     z_center: float = 0.0,
     clean_clipped: bool = True,
     verbose: bool = False,
-) -> cq.Workplane:
-
+) -> Tuple[cq.Assembly, cq.Workplane]:
     """
-    Build a cube pattern and clip ONLY cubes intersecting the bounding box boundary.
-
-    Instead of intersecting the entire lattice with a bounding box (very slow),
-    the function performs a fast bounding-box classification:
-
-        interior cubes  → kept unchanged
-        boundary cubes  → boolean intersected with box
-        outside cubes   → discarded
-
-    This reduces runtime from O(nx*ny) boolean operations to O(perimeter).
-
-    Parameters
-    ----------
-    cube : cadquery.Workplane
-        Base cube geometry already positioned around origin.
-        Can be rotated beforehand. The function copies and translates it.
-
-    nx : int
-        Number of cube positions in X direction (columns).
-
-    ny : int
-        Number of cube positions in Y direction (rows).
-
-    dx : float
-        Pitch in X direction (distance between cube centers within a row).
-
-    dy : float
-        Pitch in Y direction (distance between rows).
-
-    dx0 : float, optional
-        Horizontal offset applied to every second row (staggered pattern).
-        Row 0 has no offset, row 1 shifted by dx0, row 2 no offset, etc.
-
-    margin_x : float, optional
-        Extra margin added to bounding box in X direction.
-        Typically half the cube width so the box trims cube faces instead
-        of deleting entire cubes.
-
-    margin_y : float, optional
-        Extra margin added to bounding box in Y direction.
-        Same purpose as margin_x.
-
-    z_height : float, optional
-        Height of the clipping box in Z direction.
-        Should be larger than total pattern height to ensure full coverage.
-
-    z_center : float, optional
-        Vertical center position of the clipping box.
-        Allows moving clipping plane up/down relative to pattern.
-
-    clean_clipped : bool, optional
-        If True, topology cleanup is performed on clipped cubes only.
-        Recommended to avoid STEP artifacts but increases runtime slightly.
-
-    verbose : bool, optional
-        Print statistics about how many cubes were clipped vs untouched.
-
     Returns
     -------
-    cadquery.Workplane
-        Compound object containing all cubes after selective clipping.
-        No fusion is performed.
+    (cq.Assembly, cq.Workplane)
+        (clipped_assembly, bounding_box_solid)
     """
-
     if not isinstance(cube, cq.Workplane):
-        raise TypeError("cube must be a cadquery.Workplane")
+        raise TypeError("cube must be cadquery.Workplane")
     if nx <= 0 or ny <= 0:
         raise ValueError("nx and ny must be > 0")
     if dx <= 0 or dy <= 0:
         raise ValueError("dx and dy must be > 0")
+    if not (1 <= block_rows < ny):
+        raise ValueError("block_rows must satisfy 1 <= block_rows < ny")
     if z_height <= 0:
         raise ValueError("z_height must be > 0")
 
-    # Numeric XY bounds (placement bounds) + margins
-    bb_xy = pattern_bounding_box_xy(nx, ny, dx, dy, dx0)
-    xmin = bb_xy.xmin - margin_x
-    xmax = bb_xy.xmax + margin_x
-    ymin = bb_xy.ymin - margin_y
-    ymax = bb_xy.ymax + margin_y
-
-    cx = 0.5 * (xmin + xmax)
-    cy = 0.5 * (ymin + ymax)
-
-    # Solid box for clipping (use your generator)
-    bbox_solid = generate_rectangle((xmax - xmin), (ymax - ymin), z_height).translate((cx, cy, z_center))
-    bbox_wp = bbox_solid
+    # --- clipping solid (Workplane) and its AABB ---
+    bbox_wp = make_bounding_box_solid(
+        nx=nx, ny=ny, dx=dx, dy=dy, dx0=dx0,
+        margin_x=margin_x, margin_y=margin_y,
+        z_height=z_height, z_center=z_center,
+    )
     bbox_bb = bbox_wp.val().BoundingBox()
 
-    base = cube.val()
+    # --- build reusable block prototypes once (no union inside) ---
+    block_even = make_nrow_compound(
+        cube=cube, nx=nx, nrows=block_rows, dx=dx, dy=dy, dx0=dx0, row_start_parity=0
+    )
+    block_odd = make_nrow_compound(
+        cube=cube, nx=nx, nrows=block_rows, dx=dx, dy=dy, dx0=dx0, row_start_parity=1
+    )
 
-    kept: List[cq.Shape] = []
-    clipped_count = 0
+    bb_even = block_even.val().BoundingBox()
+    bb_odd = block_odd.val().BoundingBox()
 
-    for j in range(ny):
-        y = j * dy
-        x_off = dx0 if (j % 2 == 1) else 0.0
+    out = cq.Assembly(name="pattern_clipped")
 
-        for i in range(nx):
-            x = i * dx + x_off
-            inst = base.moved(cq.Location(cq.Vector(x, y, 0.0)))
+    full_blocks = ny // block_rows
+    rem = ny % block_rows
 
-            inst_bb = inst.BoundingBox()
+    kept = clipped = dropped = 0
 
-            # Fast classification using AABB
-            if _bbox_contains(bbox_bb, inst_bb):
-                kept.append(inst)
-                continue
+    def _shifted_bb(bb: cq.BoundBox, dy_off: float):
+        class _BB:
+            xmin = bb.xmin
+            xmax = bb.xmax
+            ymin = bb.ymin + dy_off
+            ymax = bb.ymax + dy_off
+            zmin = bb.zmin
+            zmax = bb.zmax
+        return _BB()  # lightweight with same attributes
 
-            if not _bbox_intersects(bbox_bb, inst_bb):
-                # should not happen with your described bbox choice, but safe
-                continue
+    for b in range(full_blocks):
+        start_row = b * block_rows
+        y_off = start_row * dy
 
-            # Only boundary cubes get boolean intersection
-            clipped = cq.Workplane("XY").newObject([inst]).intersect(bbox_wp)
+        use_odd = (start_row & 1) == 1
+        block_wp = block_odd if use_odd else block_even
+        block_bb0 = bb_odd if use_odd else bb_even
+        block_bb = _shifted_bb(block_bb0, y_off)
+
+        if _bbox_contains(bbox_bb, block_bb):
+            out.add(block_wp, name=f"block_{b}", loc=cq.Location(cq.Vector(0.0, y_off, 0.0)))
+            kept += 1
+            continue
+
+        if not _bbox_intersects(bbox_bb, block_bb):
+            dropped += 1
+            continue
+
+        placed = block_wp.translate((0.0, y_off, 0.0))
+        clipped_wp = placed.intersect(bbox_wp)
+        if clean_clipped:
+            clipped_wp = clipped_wp.clean()
+
+        out.add(clipped_wp, name=f"block_{b}_clipped", loc=cq.Location())
+        clipped += 1
+
+    if rem:
+        start_row = full_blocks * block_rows
+        y_off = start_row * dy
+        parity = start_row & 1
+
+        tail = make_nrow_compound(
+            cube=cube, nx=nx, nrows=rem, dx=dx, dy=dy, dx0=dx0, row_start_parity=parity
+        )
+        tail_bb0 = tail.val().BoundingBox()
+        tail_bb = _shifted_bb(tail_bb0, y_off)
+
+        if _bbox_contains(bbox_bb, tail_bb):
+            out.add(tail, name="tail", loc=cq.Location(cq.Vector(0.0, y_off, 0.0)))
+            kept += 1
+        elif not _bbox_intersects(bbox_bb, tail_bb):
+            dropped += 1
+        else:
+            placed = tail.translate((0.0, y_off, 0.0))
+            clipped_wp = placed.intersect(bbox_wp)
             if clean_clipped:
-                clipped = clipped.clean()
-            kept.append(clipped.val())
-            clipped_count += 1
+                clipped_wp = clipped_wp.clean()
+            out.add(clipped_wp, name="tail_clipped", loc=cq.Location())
+            clipped += 1
 
     if verbose:
-        print(f"[clip] total cubes: {nx*ny}, clipped cubes: {clipped_count}, untouched: {nx*ny - clipped_count}")
+        print(f"[assy-clip] kept={kept}, clipped={clipped}, dropped={dropped}")
 
-    return cq.Workplane("XY").newObject(kept)
-
-def make_substrate_from_pattern_xy(
-    pattern: cq.Workplane,
-    nx: int,
-    ny: int,
-    dx: float,
-    dy: float,
-    dx0: float = 0.0,
-    margin_x: float = 0.0,
-    margin_y: float = 0.0,
-    h: float = 5.0,
-    z_offset: float = 0.0,
-) -> cq.Workplane:
-    """
-    Create a substrate block sized to the pattern's XY bounding box (+ margins),
-    with thickness h, placed below the pattern so its top face touches the
-    lowest Z of the pattern, then shifted by z_offset.
-
-    z_offset:
-        Positive → moves substrate upward into the pattern
-        Negative → moves substrate further downward
-    """
-
-    if not isinstance(pattern, cq.Workplane):
-        raise TypeError("pattern must be a cadquery.Workplane")
-    if h <= 0:
-        raise ValueError("h must be > 0")
-
-    bb_xy = pattern_bounding_box_xy(nx, ny, dx, dy, dx0)
-
-    size_x = (bb_xy.xmax - bb_xy.xmin) + 2.0 * margin_x
-    size_y = (bb_xy.ymax - bb_xy.ymin) + 2.0 * margin_y
-
-    if size_x <= 0 or size_y <= 0:
-        raise ValueError("Invalid substrate XY dimensions")
-
-    cx = 0.5 * (bb_xy.xmin + bb_xy.xmax)
-    cy = 0.5 * (bb_xy.ymin + bb_xy.ymax)
-
-    # contact with pattern bottom
-    pat_bb = pattern.val().BoundingBox()
-    z_contact = pat_bb.zmin
-    z_center = z_contact - h / 2.0 + z_offset
-
-    substrate = generate_rectangle(size_x, size_y, h).translate((cx, cy, z_center))
-
-    return substrate
+    return out, bbox_wp
