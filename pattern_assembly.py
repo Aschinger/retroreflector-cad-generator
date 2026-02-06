@@ -2,40 +2,90 @@ import cadquery as cq
 from typing import List
 from geometry import generate_rectangle
 
-def make_row_compound(cube: cq.Workplane, nx: int, dx: float) -> cq.Workplane:
-    """
-    One row as a compound (no union): cubes at x = i*dx, y=0.
-    """
-    base = cube.val()
-    solids = [base.moved(cq.Location(cq.Vector(i * dx, 0.0, 0.0))) for i in range(nx)]
-    return cq.Workplane("XY").newObject(solids)
-
-
-def make_4row_compound(
+def make_nrow_compound(
     cube: cq.Workplane,
     nx: int,
+    nrows: int,
     dx: float,
     dy: float,
     dx0: float = 0.0,
+    row_start_parity: int = 0,
 ) -> cq.Workplane:
     """
-    4 rows as one compound (no union), with stagger:
-      row 0: x_off=0
-      row 1: x_off=dx0
-      row 2: x_off=0
-      row 3: x_off=dx0
+    nrows rows as one compound (no union), with stagger.
+    row_start_parity:
+        0 -> first row has x_off = 0
+        1 -> first row has x_off = dx0
     """
+    if not isinstance(cube, cq.Workplane):
+        raise TypeError("cube must be cadquery.Workplane")
+    if nx <= 0 or nrows <= 0:
+        raise ValueError("nx and nrows must be > 0")
+    if dx <= 0 or dy <= 0:
+        raise ValueError("dx and dy must be > 0")
+    if row_start_parity not in (0, 1):
+        raise ValueError("row_start_parity must be 0 or 1")
+
     base = cube.val()
     solids: List[cq.Shape] = []
 
-    for r in range(4):
+    # Tight loop; avoid extra work
+    for r in range(nrows):
         y = r * dy
-        x_off = dx0 if (r % 2 == 1) else 0.0
+        x_off = dx0 if ((row_start_parity + r) & 1) else 0.0
+
         for i in range(nx):
             x = i * dx + x_off
             solids.append(base.moved(cq.Location(cq.Vector(x, y, 0.0))))
 
     return cq.Workplane("XY").newObject(solids)
+
+def make_nrow_union(
+    cube: cq.Workplane,
+    nx: int,
+    nrows: int,
+    dx: float,
+    dy: float,
+    dx0: float = 0.0,
+    row_start_parity: int = 0,
+    clean: bool = True,
+) -> cq.Workplane:
+    """
+    nrows rows fused (union) into one solid, with stagger.
+
+    row_start_parity:
+        0 -> first row has x_off = 0
+        1 -> first row has x_off = dx0
+    """
+    if not isinstance(cube, cq.Workplane):
+        raise TypeError("cube must be cadquery.Workplane")
+    if nx <= 0 or nrows <= 0:
+        raise ValueError("nx and nrows must be > 0")
+    if dx <= 0 or dy <= 0:
+        raise ValueError("dx and dy must be > 0")
+    if row_start_parity not in (0, 1):
+        raise ValueError("row_start_parity must be 0 or 1")
+
+    base = cube.val()
+    solids: List[cq.Shape] = []
+
+    for r in range(nrows):
+        y = r * dy
+        x_off = dx0 if ((row_start_parity + r) & 1) else 0.0
+
+        for i in range(nx):
+            x = i * dx + x_off
+            solids.append(base.moved(cq.Location(cq.Vector(x, y, 0.0))))
+
+    wp = cq.Workplane("XY").newObject(solids)
+
+    # Single multi-boolean fuse (fastest reliable)
+    wp = wp.union()
+
+    if clean:
+        wp = wp.clean()
+
+    return wp
 
 def make_pattern_assembly(
     cube: cq.Workplane,
@@ -44,50 +94,66 @@ def make_pattern_assembly(
     dx: float,
     dy: float,
     dx0: float = 0.0,
-):
+    block_rows: int = 4,
+) -> cq.Assembly:
     """
-    Export a large staggered pattern as a STEP assembly by instancing a 4-row compound.
+    Fast assembly builder by instancing row-block compounds.
 
-    This reduces assembly elements from (nx*ny) to approximately:
-        ceil(ny/4) blocks + (optional remainder row compound)
-    while keeping 'no union' behavior.
+    Performance characteristics:
+      - builds at most 3 compounds total:
+          block_even, block_odd, tail(optional)
+      - instances those compounds (cheap)
     """
-    if ny <= 0 or nx <= 0:
+    if not isinstance(cube, cq.Workplane):
+        raise TypeError("cube must be cadquery.Workplane")
+    if nx <= 0 or ny <= 0:
         raise ValueError("nx and ny must be > 0")
-
-    block4 = make_4row_compound(cube, nx=nx, dx=dx, dy=dy, dx0=dx0)
+    if dx <= 0 or dy <= 0:
+        raise ValueError("dx and dy must be > 0")
+    if not (1 <= block_rows < ny):
+        raise ValueError("block_rows must satisfy 1 <= block_rows < ny")
 
     assy = cq.Assembly(name="pattern")
 
-    full_blocks = ny // 4
-    rem = ny % 4
+    full_blocks = ny // block_rows
+    rem = ny % block_rows
 
-    # Place full 4-row blocks
+    # Build reusable prototypes ONCE (only two parities exist)
+    block_even = make_nrow_compound(
+        cube=cube, nx=nx, nrows=block_rows, dx=dx, dy=dy, dx0=dx0, row_start_parity=0
+    )
+    block_odd = make_nrow_compound(
+        cube=cube, nx=nx, nrows=block_rows, dx=dx, dy=dy, dx0=dx0, row_start_parity=1
+    )
+
+    # Instance blocks
     for b in range(full_blocks):
-        y_off = b * 4 * dy
+        start_row = b * block_rows
+        y_off = start_row * dy
+
+        # Choose correct prototype based on start_row parity
+        block = block_odd if (start_row & 1) else block_even
+
         assy.add(
-            block4,
-            name=f"block4_{b}",
+            block,
+            name=f"block_{b}",
             loc=cq.Location(cq.Vector(0.0, y_off, 0.0)),
         )
 
-    # Handle remaining rows (0..3) as one smaller compound
+    # Tail built once (if needed), with correct start parity
     if rem:
-        base = cube.val()
-        solids: List[cq.Shape] = []
-        start_row = full_blocks * 4
+        start_row = full_blocks * block_rows
+        parity = start_row & 1
 
-        for r in range(rem):
-            j = start_row + r
-            y = j * dy
-            x_off = dx0 if (j % 2 == 1) else 0.0
-            for i in range(nx):
-                x = i * dx + x_off
-                solids.append(base.moved(cq.Location(cq.Vector(x, y, 0.0))))
+        tail = make_nrow_compound(
+            cube=cube, nx=nx, nrows=rem, dx=dx, dy=dy, dx0=dx0, row_start_parity=parity
+        )
 
-        tail = cq.Workplane("XY").newObject(solids)
-        assy.add(tail, name="tail", loc=cq.Location())  # identity
-
+        assy.add(
+            tail,
+            name="tail",
+            loc=cq.Location(cq.Vector(0.0, start_row * dy, 0.0)),
+        )
     return assy
 
 def assembly_zmin(assy: cq.Assembly) -> float:

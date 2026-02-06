@@ -69,3 +69,56 @@ def export_step(obj: cq.Workplane | cq.Assembly, filepath: str | Path, overwrite
         return path
 
     raise TypeError("obj must be cadquery.Workplane or cadquery.Assembly")
+
+
+def export_mesh(
+    assy: cq.Assembly,
+    filepath: str | Path,
+    tolerance: float = 0.1,
+    angular_tolerance: float = 0.1,
+    overwrite: bool = True,
+) -> Path:
+    """
+    Export a CadQuery Assembly to a mesh format (STL or 3MF).
+
+    Parameters
+    ----------
+    assy : cq.Assembly
+        Assembly to export
+    filepath : str | Path
+        Output file path (.stl or .3mf)
+    tolerance : float
+        Linear deflection (smaller = finer mesh)
+    angular_tolerance : float
+        Angular deflection in radians
+    overwrite : bool
+        Allow overwriting existing file
+
+    Returns
+    -------
+    Path
+        Written file path
+    """
+
+    path = Path(filepath)
+
+    if path.exists() and not overwrite:
+        raise FileExistsError(path)
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    if path.suffix.lower() not in {".stl", ".3mf"}:
+        raise ValueError("Only .stl and .3mf supported")
+
+    # Convert assembly → compound solid with locations applied
+    compound = assy.toCompound()
+
+    # Export mesh
+    cq.exporters.export(
+        compound,
+        str(path),
+        tolerance=tolerance,
+        angularTolerance=angular_tolerance,
+    )
+
+    return path
