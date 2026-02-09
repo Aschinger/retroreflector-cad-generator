@@ -1,23 +1,22 @@
 import math
 import time
 
-from geometry import generate_rectangle, rotate_hexagonal_cube_corner, cut_at_z_plane_from_top
-from pattern_assembly_clip import make_pattern
-from substrate import make_substrate_cut_by_bbox, add_substrate
+from hcc_unit_cell import HccUnitCell
+from pattern import Pattern, PatternLayout
+from substrate import Substrate, SubstrateParams
 from cad_export import export_mesh, export_step
 
-# SETTINGS
+#  ----  SETTINGS -------------------------------------------------------------
 # start time measurement
 t0 = time.perf_counter()
 # define length of cube edge
-edge_length_mm = 0.2  # mm
-# define number of cubes in X and Y directions
-nx=10
-ny=10
-# define substrate thickness
-substrate_thickness_mm = 3
-substrate_margin_mm = 0.5
-block_rows = 1  # number of rows in each block of the pattern assembly (for performance optimization, see make_pattern_assembly)
+edge_length_mm = 0.087  # mm
+
+# define edge length by structure height (for hexagonal cube corner shape) and calculate edge length accordingly
+structure_height_mm = 0.1  # mm
+edge_length_mm = structure_height_mm / (2 * 0.5 * math.sin(math.atan(math.sqrt(2)))*math.sqrt(2))
+
+print(f"Calculated edge length for structure height {structure_height_mm} mm: {edge_length_mm:.3f} mm")
 
 # CALCULATIONS
 face_diagonal_mm = math.sqrt(2) * edge_length_mm
@@ -28,71 +27,87 @@ x_offset_mm = 0.5 * math.sqrt(2) * edge_length_mm   # applied to every second ro
 # define second rotation angle for hexagonal cube corner orientation
 alpha_deg = math.degrees(math.atan(math.sqrt(2)))
 
+# define the layout of the pattern
+layout = PatternLayout(
+    nx=10,
+    ny=10,
+    dx=x_sep_mm,
+    dy=y_sep_mm,
+    dx0=x_offset_mm,
+)
+
+# define substrate
+sub_params = SubstrateParams(
+    thickness=3.0,
+    margin=0.5,
+    edge_length_mm=edge_length_mm,
+    z_extra=0.0,
+    clean=True,
+)
+
+block_rows = 1  # number of rows in each block of the pattern assembly (for performance optimization, see make_pattern_assembly)
+
 # Define limit for number of cubes to apply clipping and .step export; for large patterns,
 # it can be very slow and create huge files
-if nx*ny <= 2500:
-    print(f"Warning: Large number of cubes (nx*ny={nx*ny}). No clipping or .step export.")
+if layout.nx * layout.ny <= 2500:
+    print(f"Warning: Large number of cubes (nx*ny={layout.nx * layout.ny}). No clipping or .step export.")
     is_small_pattern = True
 else:   is_small_pattern = False
 
+#  ----  Generate Objects -------------------------------------------------------------
+print(f"Make the unit cell...")
 
 # generate cube as unit cell
 # the cube is larger as then the desired edge length to fill up empty spaces between cubes after rotation,
 # but the final pattern will be cut to the desired size
 scale_f = 2.0
-cube = generate_rectangle(scale_f * edge_length_mm, scale_f * edge_length_mm, scale_f * edge_length_mm)
 
+cell = HccUnitCell(scale_f * edge_length_mm)
+cell.make_cube()
 
 # rotate 45° around Z axis and then 54.7356° around X axis
-cube_rot = rotate_hexagonal_cube_corner(cube)
+cell.rotate_corner_cube()
 
 # cut cube and keep only the top half (in Z direction) to get a hexagonal cube corner shape
-cube_rot_cut = cut_at_z_plane_from_top(cube_rot, z_plane=-scale_f * 0.5 * math.sin(math.radians(alpha_deg))*face_diagonal_mm, keep="top")
-
-# time measurement for geometry prep
-print(f"[Runtime] Geometry Preparation: {time.perf_counter() - t0:.3f} s")
+structure_height = scale_f * 0.5 * math.sin(math.radians(alpha_deg))*face_diagonal_mm
+print(f'Structure height: {structure_height:.3f} mm')
+cell.cut_from_top(z_plane=-structure_height, keep="top")
+cube_rot_cut = cell.shape()
 
 # generate pattern of cubes in staggered grid
 print(f"Generating the pattern...")
 
-# mage the pattern of cubes as an assembly by instancing a 4-row compound,
-# which reduces the number of assembly elements and keeps 'no union' behavior
-assy, bbox_wp =make_pattern(
+pattern = Pattern(
     cube=cube_rot_cut,
-    nx=nx,
-    ny=ny,
-    dx=x_sep_mm,
-    dy=y_sep_mm,
-    dx0=x_offset_mm,
-    block_rows=block_rows,  # n
-    do_clip = is_small_pattern,
+    layout=layout,
+    block_rows=block_rows,
+    margin_x=0.0,
+    margin_y=0.0,
 )
-# Runtime measurement
-print(f"[Runtime] Generating Pattern: {time.perf_counter() - t0:.3f} s")
+
+assy, bbox_wp = pattern.build(do_clip=is_small_pattern, clean_clipped=is_small_pattern)
+
 
 # add substrate as one solid to the assembly
 print(f"Add substrate ...")
 
-substrate_cut = make_substrate_cut_by_bbox(
-    assy=assy,
-    bbox_wp=bbox_wp,
-    thickness=substrate_thickness_mm,        # substrate thickness [mm]
-    margin=substrate_margin_mm,           # extra border around pattern [mm]
-    nx=nx,
-    ny=ny,
-    dx=x_sep_mm,
-    dy=y_sep_mm,
-    dx0=x_offset_mm,
-    edge_length_mm=edge_length_mm,   # cube edge length
-    move_by_bbox_height=False,
-    move_direction="up",
+sub = Substrate(layout, sub_params)
+
+substrate_wp = sub.make_cut_by_bbox(pattern_assy=assy, bbox_wp=bbox_wp)
+
+assy_final = Substrate.wrap_with_pattern(
+    pattern_assy=assy,
+    substrate_wp=substrate_wp,
+    top_name="pattern_with_substrate",
 )
 
-assy_final = add_substrate(assy, substrate_cut)
+# Runtime measurement
+print(f"[Runtime] Generating Pattern and Substrate: {time.perf_counter() - t0:.3f} s")
 
+#  ----  Export -------------------------------------------------------------
 # export assembly as file
 print(f"Export to file ...")
-file_name = f'Retroreflector_Nx{nx}_Ny{ny}_Pitch{edge_length_mm}_Block{block_rows}'
+file_name = f'Retroreflector_Nx{layout.nx}_Ny{layout.ny}_Pitch{edge_length_mm}_Block{block_rows}'
 
 # export .step only if the pattern is not too large,
 # as it can be very slow and create huge files; for large patterns, only export .stl mesh
