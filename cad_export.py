@@ -33,6 +33,37 @@ def _validate_step_path(filepath: str | Path, overwrite: bool = True) -> Path:
 
     return path.resolve()
 
+def _validate_stl_path(filepath: str | Path, overwrite: bool = True) -> Path:
+    """
+    Validate and normalize STEP export path.
+    """
+    if filepath is None:
+        raise ValueError("filepath cannot be None")
+
+    path = Path(filepath).expanduser()
+
+    # Must contain filename
+    if path.name == "":
+        raise ValueError("filepath must include a filename")
+
+    # Ensure extension
+    if path.suffix == "":
+        path = path.with_suffix(".stl")
+    elif path.suffix.lower() not in {".stl"}:
+        raise ValueError("File extension must be .stl")
+
+    # Prevent directory misuse
+    if path.exists() and path.is_dir():
+        raise ValueError("filepath points to a directory, not a file")
+
+    # Create parent directory
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Overwrite protection
+    if path.exists() and not overwrite:
+        raise FileExistsError(f"{path} already exists")
+
+    return path.resolve()
 
 def export_step(obj: cq.Workplane | cq.Assembly, filepath: str | Path, overwrite: bool = True) -> Path:
     """
@@ -100,15 +131,7 @@ def export_mesh(
         Written file path
     """
 
-    path = Path(filepath)
-
-    if path.exists() and not overwrite:
-        raise FileExistsError(path)
-
-    path.parent.mkdir(parents=True, exist_ok=True)
-
-    if path.suffix.lower() not in {".stl", ".3mf"}:
-        raise ValueError("Only .stl and .3mf supported")
+    path = _validate_stl_path(filepath, overwrite)
 
     # Convert assembly → compound solid with locations applied
     compound = assy.toCompound()

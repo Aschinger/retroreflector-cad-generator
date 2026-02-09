@@ -2,9 +2,9 @@ import math
 import time
 
 from geometry import generate_rectangle, rotate_hexagonal_cube_corner, cut_at_z_plane_from_top
-from geometry_clip import clip_pattern_assembly_by_bbox
-from pattern_assembly import make_pattern_assembly, add_substrate, add_frame_around_pattern
-from cad_export import export_step, export_mesh
+from pattern_assembly_clip import make_pattern
+from substrate import make_substrate_cut_by_bbox, add_substrate
+from cad_export import export_mesh, export_step
 
 # SETTINGS
 # start time measurement
@@ -12,12 +12,12 @@ t0 = time.perf_counter()
 # define length of cube edge
 edge_length_mm = 0.2  # mm
 # define number of cubes in X and Y directions
-nx=50
-ny=50
+nx=10
+ny=10
 # define substrate thickness
 substrate_thickness_mm = 3
 substrate_margin_mm = 0.5
-block_rows = 10  # number of rows in each block of the pattern assembly (for performance optimization, see make_pattern_assembly)
+block_rows = 1  # number of rows in each block of the pattern assembly (for performance optimization, see make_pattern_assembly)
 
 # CALCULATIONS
 face_diagonal_mm = math.sqrt(2) * edge_length_mm
@@ -27,6 +27,13 @@ y_sep_mm = math.sqrt(math.pow(edge_length_mm, 2) + math.pow(face_diagonal_mm / 2
 x_offset_mm = 0.5 * math.sqrt(2) * edge_length_mm   # applied to every second row
 # define second rotation angle for hexagonal cube corner orientation
 alpha_deg = math.degrees(math.atan(math.sqrt(2)))
+
+# Define limit for number of cubes to apply clipping and .step export; for large patterns,
+# it can be very slow and create huge files
+if nx*ny <= 2500:
+    print(f"Warning: Large number of cubes (nx*ny={nx*ny}). No clipping or .step export.")
+    is_small_pattern = True
+else:   is_small_pattern = False
 
 
 # generate cube as unit cell
@@ -50,7 +57,7 @@ print(f"Generating the pattern...")
 
 # mage the pattern of cubes as an assembly by instancing a 4-row compound,
 # which reduces the number of assembly elements and keeps 'no union' behavior
-assy=clip_pattern_assembly_by_bbox(
+assy, bbox_wp =make_pattern(
     cube=cube_rot_cut,
     nx=nx,
     ny=ny,
@@ -58,6 +65,7 @@ assy=clip_pattern_assembly_by_bbox(
     dy=y_sep_mm,
     dx0=x_offset_mm,
     block_rows=block_rows,  # n
+    do_clip = is_small_pattern,
 )
 # Runtime measurement
 print(f"[Runtime] Generating Pattern: {time.perf_counter() - t0:.3f} s")
@@ -65,8 +73,9 @@ print(f"[Runtime] Generating Pattern: {time.perf_counter() - t0:.3f} s")
 # add substrate as one solid to the assembly
 print(f"Add substrate ...")
 
-assy = add_substrate(
+substrate_cut = make_substrate_cut_by_bbox(
     assy=assy,
+    bbox_wp=bbox_wp,
     thickness=substrate_thickness_mm,        # substrate thickness [mm]
     margin=substrate_margin_mm,           # extra border around pattern [mm]
     nx=nx,
@@ -75,27 +84,24 @@ assy = add_substrate(
     dy=y_sep_mm,
     dx0=x_offset_mm,
     edge_length_mm=edge_length_mm,   # cube edge length
+    move_by_bbox_height=False,
+    move_direction="up",
 )
 
-assy = add_frame_around_pattern(
-    assy,
-    substrate_thickness=substrate_thickness_mm,
-    margin=substrate_margin_mm,
-    nx=nx,
-    ny=ny,
-    dx=x_sep_mm,
-    dy=y_sep_mm,
-    dx0=x_offset_mm,
-    edge_length_mm=edge_length_mm,
-    clearance=0.0,   # optional opening clearance
-)
+assy_final = add_substrate(assy, substrate_cut)
 
-# export assemgly as file
+# export assembly as file
 print(f"Export to file ...")
 file_name = f'Retroreflector_Nx{nx}_Ny{ny}_Pitch{edge_length_mm}_Block{block_rows}'
-#export_step(assy, f"output/{file_name}.step")
-export_mesh(assy, f"output/{file_name}.stl", tolerance=0.005)
-#export_mesh(assy, f"output/{file_name}.3mf", tolerance=0.005)
+
+# export .step only if the pattern is not too large,
+# as it can be very slow and create huge files; for large patterns, only export .stl mesh
+if is_small_pattern:
+    export_step(assy_final, f"output/{file_name}.step")
+
+# export mesh with a tolerance of 0.005 mm (smaller tolerance means finer mesh and larger file size)
+export_mesh(assy_final, f"output/{file_name}.stl", tolerance=0.005)
+#export_mesh(assy_final, f"output/{file_name}.3mf", tolerance=0.005)
 
 # final runtime measurement
 print(f"[Runtime] Total: {time.perf_counter() - t0:.3f} s")

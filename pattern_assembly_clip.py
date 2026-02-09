@@ -1,68 +1,45 @@
+from typing import Tuple, List
+
 import cadquery as cq
+
+
 from geometry import generate_rectangle
-from pattern_assembly import make_nrow_compound
-from dataclasses import dataclass
-
-
-@dataclass(frozen=True)
-class PatternBBox:
-    xmin: float
-    xmax: float
-    ymin: float
-    ymax: float
-
-def pattern_bounding_box_xy(nx: int, ny: int, dx: float, dy: float, dx0: float = 0.0) -> PatternBBox:
-    if nx <= 0 or ny <= 0:
-        raise ValueError("nx and ny must be > 0")
-    if dx <= 0 or dy <= 0:
-        raise ValueError("dx and dy must be > 0")
-
-    x0 = 0.0
-    x1 = (nx - 1) * dx
-
-    if ny >= 2:
-        x0_odd = dx0
-        x1_odd = (nx - 1) * dx + dx0
-        xmin = min(x0, x0_odd)
-        xmax = max(x1, x1_odd)
-    else:
-        xmin, xmax = x0, x1
-
-    ymin = 0.0
-    ymax = (ny - 1) * dy
-
-    return PatternBBox(xmin, xmax, ymin, ymax)
+from pattern_layout import pattern_bounding_box_xy, validate_block_rows, validate_pattern_inputs
 
 
 def make_bounding_box_solid(
-    nx: int,
-    ny: int,
-    dx: float,
-    dy: float,
-    dx0: float = 0.0,
-    margin_x: float = 0.0,
-    margin_y: float = 0.0,
-    z_height: float = 10000.0,
-    z_center: float = 0.0,
+        cube: cq.Workplane,
+        nx: int,
+        ny: int,
+        dx: float,
+        dy: float,
+        dx0: float = 0.0,
+        margin_x: float = 0.0,
+        margin_y: float = 0.0,
 ) -> cq.Workplane:
     """
-    Bounding box solid using generate_rectangle()
+    Bounding box solid in XY from layout (+ margins) and in Z exactly from cube height.
     """
+    if not isinstance(cube, cq.Workplane):
+        raise TypeError("cube must be cadquery.Workplane")
 
-    bb = pattern_bounding_box_xy(nx, ny, dx, dy, dx0)
+    bb_xy = pattern_bounding_box_xy(nx, ny, dx, dy, dx0)
 
-    size_x = (bb.xmax - bb.xmin) + 2 * margin_x
-    size_y = (bb.ymax - bb.ymin) + 2 * margin_y
+    size_x = (bb_xy.xmax - bb_xy.xmin) + 2.0 * margin_x
+    size_y = (bb_xy.ymax - bb_xy.ymin) + 2.0 * margin_y
+    if size_x <= 0 or size_y <= 0:
+        raise ValueError("Invalid bounding box XY dimensions")
 
-    if size_x <= 0 or size_y <= 0 or z_height <= 0:
-        raise ValueError("Invalid bounding box dimensions")
+    cx = 0.5 * (bb_xy.xmin + bb_xy.xmax)
+    cy = 0.5 * (bb_xy.ymin + bb_xy.ymax)
 
-    center_x = 0.5 * (bb.xmin + bb.xmax)
-    center_y = 0.5 * (bb.ymin + bb.ymax)
+    bb_z = cube.val().BoundingBox()
+    z_height = bb_z.zmax - bb_z.zmin
+    if z_height <= 0:
+        raise ValueError("Invalid cube Z height")
+    z_center = 0.5 * (bb_z.zmin + bb_z.zmax)
 
-    box = generate_rectangle(size_x, size_y, z_height)
-    box = box.translate((center_x, center_y, z_center))
-
+    box = generate_rectangle(size_x, size_y, z_height).translate((cx, cy, z_center))
     return box
 
 def _bbox_contains(bb_outer: cq.BoundBox, bb_inner: cq.BoundBox) -> bool:
@@ -79,7 +56,45 @@ def _bbox_intersects(a: cq.BoundBox, b: cq.BoundBox) -> bool:
         a.zmax < b.zmin or a.zmin > b.zmax
     )
 
-def clip_pattern_assembly_by_bbox(
+def make_nrow_compound(
+    cube: cq.Workplane,
+    nx: int,
+    nrows: int,
+    dx: float,
+    dy: float,
+    dx0: float = 0.0,
+    row_start_parity: int = 0,
+) -> cq.Workplane:
+    """
+    nrows rows as one compound (no union), with stagger.
+    row_start_parity:
+        0 -> first row has x_off = 0
+        1 -> first row has x_off = dx0
+    """
+    if not isinstance(cube, cq.Workplane):
+        raise TypeError("cube must be cadquery.Workplane")
+    if nx <= 0 or nrows <= 0:
+        raise ValueError("nx and nrows must be > 0")
+    if dx <= 0 or dy <= 0:
+        raise ValueError("dx and dy must be > 0")
+    if row_start_parity not in (0, 1):
+        raise ValueError("row_start_parity must be 0 or 1")
+
+    base = cube.val()
+    solids: List[cq.Shape] = []
+
+    # Tight loop; avoid extra work
+    for r in range(nrows):
+        y = r * dy
+        x_off = dx0 if ((row_start_parity + r) & 1) else 0.0
+
+        for i in range(nx):
+            x = i * dx + x_off
+            solids.append(base.moved(cq.Location(cq.Vector(x, y, 0.0))))
+
+    return cq.Workplane("XY").newObject(solids)
+
+def make_pattern(
     cube: cq.Workplane,
     nx: int,
     ny: int,
@@ -89,33 +104,29 @@ def clip_pattern_assembly_by_bbox(
     block_rows: int = 4,
     margin_x: float = 0.0,
     margin_y: float = 0.0,
-    z_height: float = 10_000.0,
-    z_center: float = 0.0,
     clean_clipped: bool = True,
     verbose: bool = False,
+    do_clip: bool = True,
 ) -> Tuple[cq.Assembly, cq.Workplane]:
     """
+    If do_clip is False, returns the unmodified pattern assembly plus the bbox solid.
+
     Returns
     -------
     (cq.Assembly, cq.Workplane)
-        (clipped_assembly, bounding_box_solid)
+        (assembly, bounding_box_solid)
     """
     if not isinstance(cube, cq.Workplane):
         raise TypeError("cube must be cadquery.Workplane")
-    if nx <= 0 or ny <= 0:
-        raise ValueError("nx and ny must be > 0")
-    if dx <= 0 or dy <= 0:
-        raise ValueError("dx and dy must be > 0")
-    if not (1 <= block_rows < ny):
-        raise ValueError("block_rows must satisfy 1 <= block_rows < ny")
-    if z_height <= 0:
-        raise ValueError("z_height must be > 0")
 
-    # --- clipping solid (Workplane) and its AABB ---
+    validate_pattern_inputs(nx, ny, dx, dy)
+    validate_block_rows(block_rows, ny)
+
+    # --- bbox solid (always computed/returned) ---
     bbox_wp = make_bounding_box_solid(
+        cube=cube,
         nx=nx, ny=ny, dx=dx, dy=dy, dx0=dx0,
         margin_x=margin_x, margin_y=margin_y,
-        z_height=z_height, z_center=z_center,
     )
     bbox_bb = bbox_wp.val().BoundingBox()
 
@@ -127,6 +138,30 @@ def clip_pattern_assembly_by_bbox(
         cube=cube, nx=nx, nrows=block_rows, dx=dx, dy=dy, dx0=dx0, row_start_parity=1
     )
 
+    # If no clipping: just build the normal pattern assembly (fast path)
+    if not do_clip:
+        assy = cq.Assembly(name="pattern")
+        full_blocks = ny // block_rows
+        rem = ny % block_rows
+
+        for b in range(full_blocks):
+            start_row = b * block_rows
+            y_off = start_row * dy
+            block_wp = block_odd if (start_row & 1) else block_even
+            assy.add(block_wp, name=f"block_{b}", loc=cq.Location(cq.Vector(0.0, y_off, 0.0)))
+
+        if rem:
+            start_row = full_blocks * block_rows
+            y_off = start_row * dy
+            parity = start_row & 1
+            tail = make_nrow_compound(
+                cube=cube, nx=nx, nrows=rem, dx=dx, dy=dy, dx0=dx0, row_start_parity=parity
+            )
+            assy.add(tail, name="tail", loc=cq.Location(cq.Vector(0.0, y_off, 0.0)))
+
+        return assy, bbox_wp
+
+    # --- clipping path ---
     bb_even = block_even.val().BoundingBox()
     bb_odd = block_odd.val().BoundingBox()
 
@@ -145,7 +180,7 @@ def clip_pattern_assembly_by_bbox(
             ymax = bb.ymax + dy_off
             zmin = bb.zmin
             zmax = bb.zmax
-        return _BB()  # lightweight with same attributes
+        return _BB()
 
     for b in range(full_blocks):
         start_row = b * block_rows
