@@ -10,11 +10,11 @@ from cad_export import export_mesh, export_step
 # start time measurement
 t0 = time.perf_counter()
 # define length of cube edge
-edge_length_mm = 0.087  # mm
+#edge_length_mm = 0.087  # mm
 
 # define edge length by structure height (for hexagonal cube corner shape) and calculate edge length accordingly
 structure_height_mm = 0.1  # mm
-edge_length_mm = structure_height_mm / (2 * 0.5 * math.sin(math.atan(math.sqrt(2)))*math.sqrt(2))
+edge_length_mm = round(structure_height_mm / (2 * 0.5 * math.sin(math.atan(math.sqrt(2)))*math.sqrt(2)),2)
 
 print(f"Calculated edge length for structure height {structure_height_mm} mm: {edge_length_mm:.3f} mm")
 
@@ -29,8 +29,8 @@ alpha_deg = math.degrees(math.atan(math.sqrt(2)))
 
 # define the layout of the pattern
 layout = PatternLayout(
-    nx=10,
-    ny=10,
+    nx=1050,
+    ny=1450,
     dx=x_sep_mm,
     dy=y_sep_mm,
     dx0=x_offset_mm,
